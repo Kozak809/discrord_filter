@@ -1,121 +1,169 @@
 import os
 import discord
-from supabase import create_client, Client
-from datetime import datetime
+import asyncio
+import json
+from google import genai
+from google.genai import types
 
-# ==== Настройки ====
-DISCORD_TOKEN = ""  # токен бота
-SUPABASE_URL = ""
-SUPABASE_KEY = ""
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ==== SETTINGS ====
+DISCORD_TOKEN = ""
+GEMINI_API_KEY = ""
+DB_FILE = "users.json"
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+MODEL_NAME = "gemini-3-flash-preview" 
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  
+intents.members = True
 client = discord.Client(intents=intents)
 
+# ==== FILE OPERATIONS (DB) ====
+def load_users():
+    if not os.path.exists(DB_FILE):
+        return {}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
 
-def get_user_rating(username: str):
-    user = supabase.table("users").select("rating").eq("username", username).execute().data
-    return user[0]["rating"] if user else None
+def save_users(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
+def get_rating(user_id):
+    users = load_users()
+    return users.get(str(user_id), {}).get("rating", 0)
 
-def update_rating(username: str, guild: str, change: int):
-    user = supabase.table("users").select("*").eq("username", username).execute().data
-    if user:
-        new_rating = user[0]["rating"] + change
-        supabase.table("users").update({
-            "rating": new_rating,
-            "guild": guild,
-            "updated_at": datetime.utcnow().isoformat()
-        }).eq("username", username).execute()
-        return new_rating
-    else:
-        supabase.table("users").insert({
-            "username": username,
-            "guild": guild,
-            "rating": change,
-            "updated_at": datetime.utcnow().isoformat()
-        }).execute()
-        return change
+def update_rating(user_id, change):
+    users = load_users()
+    uid = str(user_id)
+    
+    if uid not in users:
+        users[uid] = {"rating": 50, "violations": 0} 
+    
+    users[uid]["rating"] += change
+    save_users(users)
+    return users[uid]["rating"]
 
+# ==== AI LOGIC (NEW LIBRARY) ====
+async def check_message_with_ai(text: str):
+    prompt = f"""
+    You are a moderator. Check the text: "{text}".
+    If there is profanity, insults, or toxicity - is_bad: true.
+    Response ONLY JSON:
+    {{ "is_bad": bool, "reason": "str", "severity": int(1-10) }}
+    """
+    
+    try:
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        
+        if response.text:
+            return json.loads(response.text)
+        return {"is_bad": False, "reason": "Empty", "severity": 0}
 
+    except Exception as e:
+        print(f"⚠️ AI Error: {e}")
+        return {"is_bad": False, "reason": "Error", "severity": 0}
+
+# ==== MUTE FUNCTIONS ====
 async def mute_user(member: discord.Member, guild: discord.Guild):
-    """Выдаёт роль 'Muted' пользователю"""
     muted_role = discord.utils.get(guild.roles, name="Muted")
     if muted_role is None:
-        # если роли нет — создаём
-        muted_role = await guild.create_role(name="Muted", reason="Для наказаний")
-        for channel in guild.channels:
-            await channel.set_permissions(muted_role, send_messages=False, speak=False)
+        try:
+            muted_role = await guild.create_role(name="Muted")
+            for channel in guild.channels:
+                await channel.set_permissions(muted_role, send_messages=False, speak=False)
+        except:
+            return
+    
+    for channel in guild.channels:
+        if channel.overwrites_for(muted_role).send_messages is not False:
+            try:
+                await channel.set_permissions(muted_role, send_messages=False, speak=False)
+            except:
+                pass
 
-    await member.add_roles(muted_role)
-    print(f"Пользователь {member} замучен")
+    try:
+        await member.add_roles(muted_role)
+    except:
+        pass
 
-
+# ==== DISCORD EVENTS ====
 @client.event
 async def on_ready():
-    print(f"Бот вошел как {client.user}")
-
+    if not os.path.exists(DB_FILE):
+            save_users({})
+    print(f"✅ Bot is Running (by Kozak)")
 
 @client.event
 async def on_message(message: discord.Message):
     if message.author == client.user:
         return
 
-    username = str(message.author)
-    guild = message.guild.name if message.guild else "ЛС"
-    content = message.content
-
-    # Команда для просмотра рейтинга
-    if content.startswith("!rating"):
-        rating = get_user_rating(username)
-        rating = rating if rating is not None else 0
-        await message.channel.send(f"📊 {message.author.mention}, твой рейтинг: **{rating}**")
+    if message.content.startswith("!rating"):
+        rating = get_rating(message.author.id)
+        await message.channel.send(f"📊 Rating: **{rating}**")
         return
 
-    bad_words = supabase.table("bad_words").select("word").execute().data
-    bad_list = [w["word"].lower() for w in bad_words]
+    # Rating variable
+    new_rating = get_rating(message.author.id)
 
-    # Проверка на мат
-    if any(bad in content.lower() for bad in bad_list):
-        try:
-            await message.delete()
+    if len(message.content) > 3:
+        ai_result = await check_message_with_ai(message.content)
 
-            new_rating = update_rating(username, guild, -10)
+        if ai_result["is_bad"]:
+            try: await message.delete()
+            except: pass
 
-            supabase.table("users").update({
-                "last_bad_message": content,
-                "last_bad_at": datetime.utcnow().isoformat()
-            }).eq("username", username).execute()
+            users = load_users()
+            uid = str(message.author.id)
+
+            if uid not in users:
+                 users[uid] = {"rating": 50, "violations": 0}
+            
+            users[uid]["violations"] += 1
+            save_users(users)
+            
+            penalty = -5 * ai_result.get("severity", 1)
+            new_rating = update_rating(message.author.id, penalty)
 
             await message.channel.send(
-                f"⚠️ {message.author.mention}, мат запрещён! (-10 очков)",
-                delete_after=5
+                f"⚠️ {message.author.mention} удалено! Причина: {ai_result.get('reason')}\n"
+                f"Нарушение #{users[uid]['violations']}. Рейтинг: {new_rating}",
+                delete_after=10
             )
-
-            print(f"Мат: {username} ({guild}) -10 очков → рейтинг {new_rating}")
-
-            if new_rating <= 0 and message.guild:
-                await mute_user(message.author, message.guild)
-                supabase.table("users").update({"rating": 11}).eq("username", username).execute()
-                await message.channel.send(
-                    f"🔇 {message.author.mention} замучен за плохое поведение!",
-                    delete_after=5
-                )
-        except Exception as e:
-            print("Ошибка при обработке мата:", e)
-
-
-        except Exception as e:
-            print("Ошибка при обработке мата:", e)
-
-
-        except Exception as e:
-            print("Ошибка при обработке мата:", e)
+        else:
+            new_rating = update_rating(message.author.id, 1)
     else:
-        new_rating = update_rating(username, guild, +1)
-        print(f"Сообщение: {username} ({guild}) +1 очко → рейтинг {new_rating}")
+        new_rating = update_rating(message.author.id, 1)
 
+    # MUTE CHECK (General)
+    if new_rating <= 0:
+        if isinstance(message.author, discord.Member):
+            muted_role = discord.utils.get(message.guild.roles, name="Muted")
+            if muted_role and muted_role not in message.author.roles:
+                await mute_user(message.author, message.guild)
+                
+                await message.channel.send(
+                    f"🔇 {message.author.mention} muted for 10 sec due to low rating!",
+                    delete_after=10
+                )
+                
+                await asyncio.sleep(10)
+                
+                if muted_role in message.author.roles:
+                    await message.author.remove_roles(muted_role)
+                    update_rating(message.author.id, 20) # Restore points
+                    await message.channel.send(f"🔊 {message.author.mention} unmuted.", delete_after=5)
 
 client.run(DISCORD_TOKEN)
