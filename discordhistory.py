@@ -2,17 +2,15 @@ import os
 import discord
 import asyncio
 import json
-from google import genai
-from google.genai import types
+import aiohttp
 
 # ==== SETTINGS ====
 DISCORD_TOKEN = ""
-GEMINI_API_KEY = ""
+OPENAI_API_KEY = "sk-proj-"
+OPENAI_ENDPOINT = "https://api.openai.com/v1"
 DB_FILE = "users.json"
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-MODEL_NAME = "gemini-3-flash-preview" 
+MODEL_NAME = "gpt-4o-mini"  
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -48,28 +46,58 @@ def update_rating(user_id, change):
     save_users(users)
     return users[uid]["rating"]
 
-# ==== AI LOGIC (NEW LIBRARY) ====
+# ==== AI LOGIC (OPENAI GPT) ====
 async def check_message_with_ai(text: str):
     prompt = f"""
-    You are a moderator. Check the text: "{text}".
-    If there is profanity, insults, or toxicity - is_bad: true.
+    You are a lenient moderator. Check the text: "{text}".
+    
+    Only flag as bad if there is:
+    - SEVERE profanity or slurs
+    - DIRECT personal insults or attacks
+    - EXTREME toxicity or hate speech
+    
+    Ignore: mild words, jokes, sarcasm, friendly banter, caps lock, exclamation marks.
+    
+    Severity scale:
+    1-3: mild (ignore)
+    4-6: moderate (warning only)
+    7-10: severe (delete)
+    
+    Only set is_bad: true if severity >= 7.
+    
     Response ONLY JSON:
     {{ "is_bad": bool, "reason": "str", "severity": int(1-10) }}
     """
     
     try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        
-        if response.text:
-            return json.loads(response.text)
-        return {"is_bad": False, "reason": "Empty", "severity": 0}
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": "You are a content moderation assistant. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.3
+            }
+            
+            async with session.post(
+                f"{OPENAI_ENDPOINT}/chat/completions",
+                headers=headers,
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    return json.loads(content)
+                else:
+                    print(f"⚠️ API Error: {response.status}")
+                    return {"is_bad": False, "reason": "API Error", "severity": 0}
 
     except Exception as e:
         print(f"⚠️ AI Error: {e}")
@@ -102,8 +130,8 @@ async def mute_user(member: discord.Member, guild: discord.Guild):
 @client.event
 async def on_ready():
     if not os.path.exists(DB_FILE):
-            save_users({})
-    print(f"✅ Bot is Running (by Kozak)")
+        save_users({})
+    print(f"✅ Bot is Running with OpenAI GPT (by Kozak)")
 
 @client.event
 async def on_message(message: discord.Message):
@@ -122,14 +150,16 @@ async def on_message(message: discord.Message):
         ai_result = await check_message_with_ai(message.content)
 
         if ai_result["is_bad"]:
-            try: await message.delete()
-            except: pass
+            try: 
+                await message.delete()
+            except: 
+                pass
 
             users = load_users()
             uid = str(message.author.id)
 
             if uid not in users:
-                 users[uid] = {"rating": 50, "violations": 0}
+                users[uid] = {"rating": 50, "violations": 0}
             
             users[uid]["violations"] += 1
             save_users(users)
@@ -138,8 +168,8 @@ async def on_message(message: discord.Message):
             new_rating = update_rating(message.author.id, penalty)
 
             await message.channel.send(
-                f"⚠️ {message.author.mention} удалено! Причина: {ai_result.get('reason')}\n"
-                f"Нарушение #{users[uid]['violations']}. Рейтинг: {new_rating}",
+                f"⚠️ {message.author.mention} removed! Reason: {ai_result.get('reason')}\n"
+                f"Violation #{users[uid]['violations']}. Rating: {new_rating}",
                 delete_after=10
             )
         else:
@@ -151,19 +181,52 @@ async def on_message(message: discord.Message):
     if new_rating <= 0:
         if isinstance(message.author, discord.Member):
             muted_role = discord.utils.get(message.guild.roles, name="Muted")
-            if muted_role and muted_role not in message.author.roles:
-                await mute_user(message.author, message.guild)
-                
-                await message.channel.send(
-                    f"🔇 {message.author.mention} muted for 10 sec due to low rating!",
-                    delete_after=10
-                )
-                
-                await asyncio.sleep(10)
-                
-                if muted_role in message.author.roles:
-                    await message.author.remove_roles(muted_role)
-                    update_rating(message.author.id, 20) # Restore points
-                    await message.channel.send(f"🔊 {message.author.mention} unmuted.", delete_after=5)
+            
+            if muted_role is None:
+                try:
+                    muted_role = await message.guild.create_role(
+                        name="Muted",
+                        color=discord.Color.dark_gray(),
+                        reason="Auto-moderation mute role"
+                    )
+                except Exception as e:
+                    print(f"❌ Failed to create role: {e}")
+                    return
+            
+            for channel in message.guild.channels:
+                try:
+                    overwrites = channel.overwrites_for(muted_role)
+                    if overwrites.send_messages is not False or overwrites.speak is not False:
+                        await channel.set_permissions(
+                            muted_role,
+                            send_messages=False,
+                            speak=False,
+                            add_reactions=False,
+                            reason="Enforce mute permissions"
+                        )
+                except Exception as e:
+                    print(f"⚠️ Failed to set permissions for {channel.name}: {e}")
+            
+            # Check if already muted
+            if muted_role not in message.author.roles:
+                try:
+                    await message.author.add_roles(muted_role, reason="Low rating auto-mute")
+                    
+                    await message.channel.send(
+                        f"🔇 {message.author.mention} muted for 30 seconds due to low rating!",
+                        delete_after=10
+                    )
+                    
+                    await asyncio.sleep(30)
+                    
+                    if muted_role in message.author.roles:
+                        await message.author.remove_roles(muted_role, reason="Mute expired")
+                        update_rating(message.author.id, 20)  
+                        await message.channel.send(
+                            f"🔊 {message.author.mention} unmuted.",
+                            delete_after=5
+                        )
+                except Exception as e:
+                    print(f"❌ Mute error: {e}")
 
 client.run(DISCORD_TOKEN)
